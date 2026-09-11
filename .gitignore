@@ -1,0 +1,11 @@
+build/
+app/build/
+.gradle/
+*.apk
+*.class
+.idea/
+local.properties
+*.zip
+*.pt
+*.onnx
+*.tflite

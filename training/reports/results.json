@@ -1,0 +1,34 @@
+{
+  "total_scenarios": 158,
+  "drives_evaluated": [
+    "S4",
+    "S2",
+    "M",
+    "S1"
+  ],
+  "evaluation_mode": "Leave-One-Drive-Out CV (100% genuine holdout per drive)",
+  "raw_imu": {
+    "median_pct": 62.42392382591498,
+    "p90_pct": 157.31348514679974,
+    "worst_pct": 694.764780971477,
+    "pass_rate_pct": 6.329113924050633
+  },
+  "eskf_nhc": {
+    "median_pct": 25.982096379663254,
+    "p90_pct": 65.4062957018979,
+    "worst_pct": 151.8994925759896,
+    "pass_rate_pct": 17.088607594936708
+  },
+  "eskf_nhc_ai": {
+    "median_pct": 15.502233318475458,
+    "p90_pct": 45.71253016524813,
+    "worst_pct": 135.53098300322043,
+    "pass_rate_pct": 25.31645569620253
+  },
+  "full_idr": {
+    "median_pct": 11.216318986154977,
+    "p90_pct": 43.935136747185425,
+    "worst_pct": 90.820957325577,
+    "pass_rate_pct": 46.20253164556962
+  }
+}
