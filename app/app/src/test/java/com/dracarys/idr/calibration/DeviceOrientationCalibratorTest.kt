@@ -141,4 +141,84 @@ class DeviceOrientationCalibratorTest {
         assertTrue("Turning left must increase Cartesian heading", psi > (Math.PI / 2.0))
         assertEquals(Math.PI / 2.0 + 0.5, psi, 1e-5)
     }
+
+    @Test
+    fun `test streaming mount azimuth convergence during dynamic driving`() {
+        val calibrator = DeviceOrientationCalibrator()
+
+        // Known mount azimuth: 35.0 degrees offset between device X and vehicle forward
+        val psiMountKnownDeg = 35.0
+        val psiRad = Math.toRadians(psiMountKnownDeg)
+
+        // Compound tilt: windshield cradle (pitch = 25°, roll = -15°)
+        val pitch = Math.toRadians(25.0)
+        val roll = Math.toRadians(-15.0)
+        val rx = arrayOf(
+            doubleArrayOf(1.0, 0.0, 0.0),
+            doubleArrayOf(0.0, cos(pitch), sin(pitch)),
+            doubleArrayOf(0.0, -sin(pitch), cos(pitch))
+        )
+        val ry = arrayOf(
+            doubleArrayOf(cos(roll), 0.0, -sin(roll)),
+            doubleArrayOf(0.0, 1.0, 0.0),
+            doubleArrayOf(sin(roll), 0.0, cos(roll))
+        )
+        val rV2d = Array(3) { DoubleArray(3) }
+        for (i in 0 until 3) {
+            for (j in 0 until 3) {
+                var sum = 0.0
+                for (k in 0 until 3) sum += rx[i][k] * ry[k][j]
+                rV2d[i][j] = sum
+            }
+        }
+
+        val gVehicle = doubleArrayOf(0.0, 0.0, 9.80665)
+        val gDev = DeviceOrientationCalibrator.matVecMul(rV2d, gVehicle)
+
+        // Dynamic driving profile: speed 5.0 to 11.0 m/s, forward accel up to 1.2 m/s^2
+        val dt = 0.20
+        var converged = false
+        var sampleCount = 0
+
+        for (step in 0 until 100) {
+            val t = step * dt
+            val vSpeed = 8.0 + 3.0 * sin(0.5 * t)
+            val aFwd = 1.5 * cos(0.5 * t)
+            val aLat = 0.0
+
+            // Leveled frame acceleration before mounting azimuth rotation
+            val axH = cos(psiRad) * aFwd - sin(psiRad) * aLat
+            val ayH = sin(psiRad) * aFwd + cos(psiRad) * aLat
+            val leveledAcc = doubleArrayOf(axH, ayH, 0.0)
+
+            // Invert leveling matrix to get device-frame acceleration
+            val rLevel = DeviceOrientationCalibrator.computeLevelingMatrix(gDev)
+            // rLevel is orthogonal, so inverse is transpose
+            val rDevFromLevel = Array(3) { i -> DoubleArray(3) { j -> rLevel[j][i] } }
+            val devLinearAcc = DeviceOrientationCalibrator.matVecMul(rDevFromLevel, leveledAcc)
+
+            converged = calibrator.updateMountAzimuthStreaming(
+                devLinearAcc = devLinearAcc,
+                gravityVec = gDev,
+                gnssSpeedMs = vSpeed,
+                gnssForwardAcc = aFwd,
+            )
+            if (converged) sampleCount++
+        }
+
+        assertTrue("Streaming calibration must converge after 30+ qualified driving samples", calibrator.isAzimuthCalibrated)
+        assertEquals(psiMountKnownDeg, Math.toDegrees(calibrator.psiMount), 0.5)
+
+        // Verify body projection with converged azimuth
+        val testFwd = 1.8
+        val testLeveled = doubleArrayOf(cos(psiRad) * testFwd, sin(psiRad) * testFwd, 0.0)
+        val rLevel = DeviceOrientationCalibrator.computeLevelingMatrix(gDev)
+        val rDevFromLevel = Array(3) { i -> DoubleArray(3) { j -> rLevel[j][i] } }
+        val testDevAcc = DeviceOrientationCalibrator.matVecMul(rDevFromLevel, testLeveled)
+
+        val (afEst, alEst, _) = calibrator.projectVehicleBodyAccel(testDevAcc, gDev)
+        assertEquals(testFwd, afEst, 0.02)
+        assertEquals(0.0, alEst, 0.02)
+    }
 }
+

@@ -29,24 +29,49 @@ class DeviceOrientationCalibrator(
     var stationaryGyroBias: DoubleArray = DoubleArray(3)
         private set
 
-    /** Updates running average of sensor zero-rate bias while device is physically stationary. */
+    /** Updates running average of sensor zero-rate bias while device is physically resting. */
     fun updateStationaryGyroBias(gyroMeas: DoubleArray) {
         for (i in 0 until 3) {
-            stationaryGyroBias[i] = 0.95 * stationaryGyroBias[i] + 0.05 * gyroMeas[i]
+            // Only update when measured rate is within physical sensor rest noise (< 0.06 rad/s)
+            if (kotlin.math.abs(gyroMeas[i]) < 0.06) {
+                stationaryGyroBias[i] = 0.98 * stationaryGyroBias[i] + 0.02 * gyroMeas[i]
+                stationaryGyroBias[i] = stationaryGyroBias[i].coerceIn(-0.04, 0.04)
+            }
         }
     }
 
     /**
-     * Extracts rotation rate around the vehicle Up axis, corrected for stationary bias.
-     * In clockwise navigation bearing convention: turning right is positive heading rate.
+     * Extracts vehicle yaw rate around the vertical Up axis, corrected for stationary bias.
+     * Follows standard SAE/ISO vehicle dynamics convention:
+     * Positive sign corresponds to CCW rotation (turning left).
+     * Negative sign corresponds to CW rotation (turning right).
+     *
+     * Vehicle yaw rate is the projection of 3D angular velocity onto vehicle Up:
+     *     omega_yaw = (omega_gyro - bias) . u_up = (omega_unbiased . g) / ||g||
      */
-    fun extractVehicleHeadingRate(gyroMeas: DoubleArray, gravityVec: DoubleArray): Double {
+    fun extractVehicleYawRate(gyroMeas: DoubleArray, gravityVec: DoubleArray): Double {
         val uUp = computeGravityUnitUp(gravityVec)
         val unbiasedGx = gyroMeas[0] - stationaryGyroBias[0]
         val unbiasedGy = gyroMeas[1] - stationaryGyroBias[1]
         val unbiasedGz = gyroMeas[2] - stationaryGyroBias[2]
-        // Android CCW-positive around Up maps to CW-positive heading rate via negation
-        return -(unbiasedGx * uUp[0] + unbiasedGy * uUp[1] + unbiasedGz * uUp[2])
+        return unbiasedGx * uUp[0] + unbiasedGy * uUp[1] + unbiasedGz * uUp[2]
+    }
+
+    /**
+     * Extracts rotation rate around the vehicle Up axis, corrected for stationary bias.
+     *
+     * SIGN CONVENTION (MANDATORY & INVARIANT):
+     * Standard mathematical / vehicle dynamics convention (ISO 8855 / SAE J670):
+     * - Positive value (> 0) = COUNTER-CLOCKWISE (CCW, turning left) around the vehicle Up axis.
+     * - Negative value (< 0) = CLOCKWISE (CW, turning right) around the vehicle Up axis.
+     *
+     * This method conforms to standard Cartesian math convention (NOT clockwise compass bearing).
+     * Navigational bearing conversion (clockwise from North = 0°) is performed explicitly at geodetic
+     * boundaries via (90° - psi), ensuring that internal kinematics and filters consistently operate
+     * on right-handed Cartesian coordinates without hidden sign inversions.
+     */
+    fun extractVehicleHeadingRate(gyroMeas: DoubleArray, gravityVec: DoubleArray): Double {
+        return extractVehicleYawRate(gyroMeas, gravityVec)
     }
 
     companion object {

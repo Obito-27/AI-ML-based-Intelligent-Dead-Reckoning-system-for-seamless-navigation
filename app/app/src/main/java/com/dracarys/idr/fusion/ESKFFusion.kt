@@ -68,6 +68,8 @@ class ESKFFusion(
     var gyroBiasHat: Double = 0.0
     var pPos: Double = 4.0
     val qPos: Double = 0.05
+    var pVf: Double = 1.0   // Velocity error covariance
+    val qVf: Double = 2.0   // Velocity process noise base
 
     /**
      * Initializes filter state.
@@ -88,6 +90,7 @@ class ESKFFusion(
         vy = v0 * sin(psi0)
         gyroBiasHat = 0.0
         pPos = initialPosVar
+        pVf = 1.0
     }
 
     /**
@@ -112,6 +115,7 @@ class ESKFFusion(
 
     /**
      * Single-step IMU prediction tick (e.g. at 10 Hz).
+     * Implements Brossard et al. AI-IMU adaptive Kalman covariance and denoising.
      */
     fun predict(
         af: Double,
@@ -123,17 +127,23 @@ class ESKFFusion(
         aiConf: Double? = null,
         aiGyroScale: Double = DEFAULT_AI_GYRO_SCALE,
         isStationary: Boolean = false,
+        aiRv: Double? = null,
+        aiQScale: Double? = null,
+        denoiseAf: Double? = null,
+        denoiseGz: Double? = null,
     ) {
         if (isStationary) {
             vf = 0.0
             vl = 0.0
             vx = 0.0
             vy = 0.0
+            pVf = 0.01
             pPos += qPos * 0.1
             return
         }
 
-        var rawOmega = gyroZ
+        val cleanAf = af - 0.25 * (denoiseAf ?: 0.0)
+        var rawOmega = gyroZ - 0.25 * (denoiseGz ?: 0.0)
         if (aiGyroCorr != null) {
             rawOmega -= aiGyroCorr * aiGyroScale
         }
@@ -141,12 +151,23 @@ class ESKFFusion(
         val omegaCorrected = rawOmega - gyroBiasHat
         psi += omegaCorrected * stepDt
 
-        val vfRaw = vf + (af + omegaCorrected * vl) * stepDt
-        val vfPred = if (aiVf == null) {
-            vfRaw
-        } else {
-            val conf = (aiConf ?: 0.85).coerceIn(0.1, 0.95)
-            (1.0 - conf) * vfRaw + conf * aiVf
+        val qScaleVal = (aiQScale ?: 1.0).coerceIn(0.1, 10.0)
+        pVf += qVf * qScaleVal * stepDt
+
+        val vfRaw = vf + (cleanAf + omegaCorrected * vl) * stepDt
+        val vfPred = when {
+            aiVf == null -> vfRaw
+            aiRv != null -> {
+                val rv = aiRv.coerceIn(0.01, 50.0)
+                val kv = pVf / (pVf + rv)
+                val updated = vfRaw + kv * (aiVf - vfRaw)
+                pVf = (1.0 - kv) * pVf
+                updated
+            }
+            else -> {
+                val conf = (aiConf ?: 0.85).coerceIn(0.1, 0.95)
+                (1.0 - conf) * vfRaw + conf * aiVf
+            }
         }
 
         val vlPred = vl + (al - omegaCorrected * vf) * stepDt
@@ -170,7 +191,7 @@ class ESKFFusion(
 
         x += vx * stepDt
         y += vy * stepDt
-        pPos += qPos
+        pPos += qPos * qScaleVal
     }
 
     /**
@@ -193,7 +214,7 @@ class ESKFFusion(
 
         // Course-over-ground heading anchoring when moving with good GNSS quality
         if (gpsBearingDeg != null && gpsSpeedMs != null && gpsSpeedMs > 2.0 && sats >= 6) {
-            val gpsPsi = Math.toRadians(gpsBearingDeg)
+            val gpsPsi = (Math.PI / 2.0) - Math.toRadians(gpsBearingDeg)
             var dPsi = gpsPsi - psi
             while (dPsi > Math.PI) dPsi -= 2.0 * Math.PI
             while (dPsi < -Math.PI) dPsi += 2.0 * Math.PI
@@ -227,6 +248,10 @@ class ESKFFusion(
         vfMeasurement: DoubleArray? = null,
         gyroCorrection: DoubleArray? = null,
         aiConfidence: DoubleArray? = null,
+        aiRv: DoubleArray? = null,
+        aiQScale: DoubleArray? = null,
+        denoiseAf: DoubleArray? = null,
+        denoiseGz: DoubleArray? = null,
     ): FilterOutput {
         val n = t.size
         reset(x0, y0, v0, psi0, 4.0)
@@ -252,7 +277,8 @@ class ESKFFusion(
         for (k in 1 until n) {
             val stepDt = if (k > 0) t[k] - t[k - 1] else this.dt
 
-            var rawOmega = gyroZ[k]
+            val cleanAf = af[k] - 0.25 * (denoiseAf?.get(k) ?: 0.0)
+            var rawOmega = gyroZ[k] - 0.25 * (denoiseGz?.get(k) ?: 0.0)
             if (gyroCorrection != null) {
                 rawOmega -= gyroCorrection[k]
             }
@@ -264,24 +290,37 @@ class ESKFFusion(
             val hasFresh = gpsFresh[k] && !isOutage
 
             val isStat = isStationary(
-                linAccMag = kotlin.math.hypot(af[k], al[k]),
+                linAccMag = kotlin.math.hypot(cleanAf, al[k]),
                 gyroMag = kotlin.math.abs(omegaCorrected),
                 currentVf = vf,
                 gpsSpeed = if (hasFresh && gpsSpeed.size > k) gpsSpeed[k] else null,
             )
+
+            val qScaleVal = (aiQScale?.get(k) ?: 1.0).coerceIn(0.1, 10.0)
 
             if (isStat) {
                 vf = 0.0
                 vl = 0.0
                 vx = 0.0
                 vy = 0.0
+                pVf = 0.01
             } else {
-                val vfRaw = vf + (af[k] + omegaCorrected * vl) * stepDt
-                val vfPred = if (vfMeasurement == null) {
-                    vfRaw
-                } else {
-                    val conf = (aiConfidence?.get(k) ?: 0.85).coerceIn(0.1, 0.95)
-                    (1.0 - conf) * vfRaw + conf * vfMeasurement[k]
+                val vfRaw = vf + (cleanAf + omegaCorrected * vl) * stepDt
+                pVf += qVf * qScaleVal * stepDt
+
+                val vfPred = when {
+                    vfMeasurement == null -> vfRaw
+                    aiRv != null -> {
+                        val rv = aiRv[k].coerceIn(0.01, 50.0)
+                        val kv = pVf / (pVf + rv)
+                        val updated = vfRaw + kv * (vfMeasurement[k] - vfRaw)
+                        pVf = (1.0 - kv) * pVf
+                        updated
+                    }
+                    else -> {
+                        val conf = (aiConfidence?.get(k) ?: 0.85).coerceIn(0.1, 0.95)
+                        (1.0 - conf) * vfRaw + conf * vfMeasurement[k]
+                    }
                 }
 
                 val vlPred = vl + (al[k] - omegaCorrected * vf) * stepDt
@@ -303,7 +342,7 @@ class ESKFFusion(
 
             val xPred = x + vx * stepDt
             val yPred = y + vy * stepDt
-            pPos += qPos
+            pPos += qPos * qScaleVal
 
             if (hasFresh) {
                 val rK = computeGnssCovariance(gpsAccuracy[k], gpsSats[k], fixAge[k])

@@ -288,69 +288,177 @@ class MotionNetInference {
             }
         }
 
-        // 4. Output Heads from latest state h (48)
+        // 4. Output Heads from latest GRU state h (48) per AI-IMU 3-head architecture
+        // Head 1: IMU Denoising Head [delta_af, delta_gz]
+        val denW0 = weights["head_denoise.0.weight"]
+        val denB0 = weights["head_denoise.0.bias"]
+        val denW2 = weights["head_denoise.2.weight"]
+        val denB2 = weights["head_denoise.2.bias"]
 
-        // Head 1: Forward Speed (m/s)
-        val vfW0 = weights["head_vf.0.weight"] ?: return fallback() // (24, 48)
-        val vfB0 = weights["head_vf.0.bias"] ?: return fallback()
-        val vfW2 = weights["head_vf.2.weight"] ?: return fallback() // (1, 24)
-        val vfB2 = weights["head_vf.2.bias"] ?: return fallback()
-
-        val vfH1 = FloatArray(24)
-        for (i in 0 until 24) {
-            var sum = vfB0[i]
-            val base = i * 48
-            for (j in 0 until 48) sum += vfW0[base + j] * h[j]
-            vfH1[i] = max(0f, sum)
+        var denoiseAf = 0.0
+        var denoiseGz = 0.0
+        if (denW0 != null && denB0 != null && denW2 != null && denB2 != null) {
+            val denH1 = FloatArray(24)
+            for (i in 0 until 24) {
+                var sum = denB0[i]
+                val base = i * 48
+                for (j in 0 until 48) sum += denW0[base + j] * h[j]
+                denH1[i] = max(0f, sum)
+            }
+            var s0 = denB2[0]
+            var s1 = denB2[1]
+            for (j in 0 until 24) {
+                s0 += denW2[j] * denH1[j]
+                s1 += denW2[24 + j] * denH1[j]
+            }
+            denoiseAf = s0.toDouble()
+            denoiseGz = s1.toDouble()
         }
-        var vfSum = vfB2[0]
-        for (j in 0 until 24) vfSum += vfW2[j] * vfH1[j]
-        val predVf = max(0.0, max(0f, vfSum).toDouble())
 
-        // Head 2: Gyro Correction (rad/s)
-        val gyroW0 = weights["head_gyro.0.weight"] ?: return fallback()
-        val gyroB0 = weights["head_gyro.0.bias"] ?: return fallback()
-        val gyroW2 = weights["head_gyro.2.weight"] ?: return fallback()
-        val gyroB2 = weights["head_gyro.2.bias"] ?: return fallback()
+        // Head 2: Motion State Regression Head [vf, delta_gyro]
+        val motW0 = weights["head_motion.0.weight"]
+        val motB0 = weights["head_motion.0.bias"]
+        val motW2 = weights["head_motion.2.weight"]
+        val motB2 = weights["head_motion.2.bias"]
 
-        val gyroH1 = FloatArray(24)
-        for (i in 0 until 24) {
-            var sum = gyroB0[i]
-            val base = i * 48
-            for (j in 0 until 48) sum += gyroW0[base + j] * h[j]
-            gyroH1[i] = max(0f, sum)
+        var predVf = 0.0
+        var predGyro = 0.0
+        if (motW0 != null && motB0 != null && motW2 != null && motB2 != null) {
+            val motH1 = FloatArray(24)
+            for (i in 0 until 24) {
+                var sum = motB0[i]
+                val base = i * 48
+                for (j in 0 until 48) sum += motW0[base + j] * h[j]
+                motH1[i] = max(0f, sum)
+            }
+            var s0 = motB2[0]
+            var s1 = motB2[1]
+            for (j in 0 until 24) {
+                s0 += motW2[j] * motH1[j]
+                s1 += motW2[24 + j] * motH1[j]
+            }
+            predVf = max(0.0, max(0f, s0).toDouble())
+            predGyro = s1.toDouble()
+        } else {
+            // Graceful fallback to legacy heads if present
+            val vfW0 = weights["head_vf.0.weight"]
+            val vfB0 = weights["head_vf.0.bias"]
+            val vfW2 = weights["head_vf.2.weight"]
+            val vfB2 = weights["head_vf.2.bias"]
+            if (vfW0 != null && vfB0 != null && vfW2 != null && vfB2 != null) {
+                val vfH1 = FloatArray(24)
+                for (i in 0 until 24) {
+                    var sum = vfB0[i]
+                    val base = i * 48
+                    for (j in 0 until 48) sum += vfW0[base + j] * h[j]
+                    vfH1[i] = max(0f, sum)
+                }
+                var vfSum = vfB2[0]
+                for (j in 0 until 24) vfSum += vfW2[j] * vfH1[j]
+                predVf = max(0.0, max(0f, vfSum).toDouble())
+            }
+
+            val gyroW0 = weights["head_gyro.0.weight"]
+            val gyroB0 = weights["head_gyro.0.bias"]
+            val gyroW2 = weights["head_gyro.2.weight"]
+            val gyroB2 = weights["head_gyro.2.bias"]
+            if (gyroW0 != null && gyroB0 != null && gyroW2 != null && gyroB2 != null) {
+                val gyroH1 = FloatArray(24)
+                for (i in 0 until 24) {
+                    var sum = gyroB0[i]
+                    val base = i * 48
+                    for (j in 0 until 48) sum += gyroW0[base + j] * h[j]
+                    gyroH1[i] = max(0f, sum)
+                }
+                var gyroSum = gyroB2[0]
+                for (j in 0 until 24) gyroSum += gyroW2[j] * gyroH1[j]
+                predGyro = gyroSum.toDouble()
+            }
         }
-        var gyroSum = gyroB2[0]
-        for (j in 0 until 24) gyroSum += gyroW2[j] * gyroH1[j]
-        val predGyro = gyroSum.toDouble()
 
-        // Head 3: Confidence Score
-        val confW0 = weights["head_conf.0.weight"] ?: return fallback()
-        val confB0 = weights["head_conf.0.bias"] ?: return fallback()
-        val confW2 = weights["head_conf.2.weight"] ?: return fallback()
-        val confB2 = weights["head_conf.2.bias"] ?: return fallback()
+        // Head 3: Context-Aware Uncertainty / Covariance Head [log_var_v, log_var_q]
+        val uncW0 = weights["head_uncertainty.0.weight"]
+        val uncB0 = weights["head_uncertainty.0.bias"]
+        val uncW2 = weights["head_uncertainty.2.weight"]
+        val uncB2 = weights["head_uncertainty.2.bias"]
 
-        val confH1 = FloatArray(16)
-        for (i in 0 until 16) {
-            var sum = confB0[i]
-            val base = i * 48
-            for (j in 0 until 48) sum += confW0[base + j] * h[j]
-            confH1[i] = max(0f, sum)
+        var logVarV = 0.0
+        var logVarQ = 0.0
+        var predConf = 0.85
+        var rvVal = 1.0
+        var qScaleVal = 1.0
+
+        if (uncW0 != null && uncB0 != null && uncW2 != null && uncB2 != null) {
+            val uncH1 = FloatArray(24)
+            for (i in 0 until 24) {
+                var sum = uncB0[i]
+                val base = i * 48
+                for (j in 0 until 48) sum += uncW0[base + j] * h[j]
+                uncH1[i] = max(0f, sum)
+            }
+            var s0 = uncB2[0]
+            var s1 = uncB2[1]
+            for (j in 0 until 24) {
+                s0 += uncW2[j] * uncH1[j]
+                s1 += uncW2[24 + j] * uncH1[j]
+            }
+            val clS0 = s0.coerceIn(-4f, 4f)
+            val clS1 = s1.coerceIn(-4f, 4f)
+            logVarV = clS0.toDouble()
+            logVarQ = clS1.toDouble()
+            rvVal = exp(logVarV)
+            qScaleVal = exp(logVarQ)
+            predConf = (1.0 / (1.0 + exp(0.5 * logVarV))).coerceIn(0.1, 0.95)
+        } else {
+            // Graceful fallback to legacy head_conf
+            val confW0 = weights["head_conf.0.weight"]
+            val confB0 = weights["head_conf.0.bias"]
+            val confW2 = weights["head_conf.2.weight"]
+            val confB2 = weights["head_conf.2.bias"]
+            if (confW0 != null && confB0 != null && confW2 != null && confB2 != null) {
+                val confH1 = FloatArray(16)
+                for (i in 0 until 16) {
+                    var sum = confB0[i]
+                    val base = i * 48
+                    for (j in 0 until 48) sum += confW0[base + j] * h[j]
+                    confH1[i] = max(0f, sum)
+                }
+                var confSum = confB2[0]
+                for (j in 0 until 16) confSum += confW2[j] * confH1[j]
+                val confSig = 1.0f / (1.0f + exp(-confSum))
+                predConf = 0.1 + 0.85 * confSig.toDouble()
+            }
         }
-        var confSum = confB2[0]
-        for (j in 0 until 16) confSum += confW2[j] * confH1[j]
-        val confSig = 1.0f / (1.0f + exp(-confSum))
-        val predConf = 0.1 + 0.85 * confSig.toDouble()
 
-        return InferenceResult(predVf, predGyro, predConf)
+        return InferenceResult(
+            predictedVelocity = predVf,
+            gyroCorrection = predGyro,
+            confidence = predConf,
+            denoisedAf = denoiseAf,
+            denoisedGz = denoiseGz,
+            measurementVarianceRv = rvVal,
+            processVarianceScaleQ = qScaleVal,
+        )
     }
 
-    private fun fallback(): InferenceResult = InferenceResult(0.0, 0.0, 0.5)
+    private fun fallback(): InferenceResult = InferenceResult(
+        predictedVelocity = 0.0,
+        gyroCorrection = 0.0,
+        confidence = 0.5,
+        denoisedAf = 0.0,
+        denoisedGz = 0.0,
+        measurementVarianceRv = 1.0,
+        processVarianceScaleQ = 1.0,
+    )
 
     data class InferenceResult(
         val predictedVelocity: Double,
         val gyroCorrection: Double,
         val confidence: Double,
+        val denoisedAf: Double = 0.0,
+        val denoisedGz: Double = 0.0,
+        val measurementVarianceRv: Double = 1.0,
+        val processVarianceScaleQ: Double = 1.0,
     )
 
     private data class TensorMeta(val name: String, val shape: IntArray)

@@ -66,6 +66,8 @@ class FakeNavigationRepository(
         }
     }
 
+
+
     override fun toggleDebugOutage() {
         setDebugOutage(!_isDebugOutageActive.value)
     }

@@ -23,9 +23,9 @@ def test_onnx_export_and_inference():
     outputs = session.run(None, {"imu_window": dummy_in})
     
     assert len(outputs) == 3
-    assert outputs[0].shape == (2, 1)  # vf
-    assert outputs[1].shape == (2, 1)  # gyro
-    assert outputs[2].shape == (2, 1)  # conf
+    assert outputs[0].shape == (2, 2)  # denoise_imu [delta_af, delta_gz]
+    assert outputs[1].shape == (2, 2)  # motion_state [vf, delta_gyro]
+    assert outputs[2].shape == (2, 2)  # uncertainty_covar [log_var_v, log_var_q]
 
 
 def test_tflite_export_and_header():

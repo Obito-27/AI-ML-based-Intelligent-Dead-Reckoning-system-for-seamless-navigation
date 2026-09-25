@@ -122,9 +122,17 @@ fun InstrumentCapsule(
             label = "capsule_expand",
         ) { expanded ->
             if (!expanded) {
-                CapsuleCollapsed(state = state, onDebugToggle = onDebugToggle, debugEnabled = debugEnabled)
+                CapsuleCollapsed(
+                    state = state,
+                    onDebugToggle = onDebugToggle,
+                    debugEnabled = debugEnabled,
+                )
             } else {
-                CapsuleExpanded(state = state, onDebugToggle = onDebugToggle, debugEnabled = debugEnabled)
+                CapsuleExpanded(
+                    state = state,
+                    onDebugToggle = onDebugToggle,
+                    debugEnabled = debugEnabled,
+                )
             }
         }
     }

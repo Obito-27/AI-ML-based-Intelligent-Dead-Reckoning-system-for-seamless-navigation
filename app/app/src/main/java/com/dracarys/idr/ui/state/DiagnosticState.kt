@@ -27,6 +27,12 @@ data class DiagnosticState(
     val gpsSpeed: Double = 0.0,
     val gpsSats: Int = 0,
     val hasFreshGps: Boolean = false,
+    val rawGpsLat: Double = 0.0,
+    val rawGpsLon: Double = 0.0,
+    val rawGpsAccuracyM: Float = 0f,
+    val gpsProvider: String = "none",
+    val isGpsProviderEnabled: Boolean = false,
+    val isNetworkProviderEnabled: Boolean = false,
 ) {
     val accMag: Float
         get() = kotlin.math.sqrt(rawAcc[0] * rawAcc[0] + rawAcc[1] * rawAcc[1] + rawAcc[2] * rawAcc[2])

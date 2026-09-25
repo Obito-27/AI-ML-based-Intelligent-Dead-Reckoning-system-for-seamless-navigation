@@ -48,6 +48,10 @@ def run_single_outage(
     gyro_ai_full: np.ndarray,
     conf_ai_full: np.ndarray,
     map_matcher: SoftMapMatcher,
+    rv_ai_full: Optional[np.ndarray] = None,
+    q_scale_full: Optional[np.ndarray] = None,
+    denoise_af_full: Optional[np.ndarray] = None,
+    denoise_gz_full: Optional[np.ndarray] = None,
 ):
     """Evaluates one outage segment across all 4 pipeline stages."""
     end_idx = min(len(drive.t), start_idx + outage_len)
@@ -122,13 +126,16 @@ def run_single_outage(
     x_eskf, y_eskf, vf_eskf = eskf_nhc(sc_dict)
     m_eskf = compute_metrics(x_eskf, y_eskf, x_gt, y_gt, dist_seg)
     
-    # 3. Stage 3: ESKF + NHC + AI Velocity Net
-    # High confidence in on-device AI speed model over unconstrained raw accelerometer double integration
+    # 3. Stage 3: ESKF + NHC + AI Velocity Net with learned Brossard et al. Kalman Covariance
     x_ai, y_ai, _ = eskf_nhc(
         sc_dict,
         vf_measurement=vf_ai_full[sl],
-        gyro_correction=gyro_ai_full[sl],  # scaled by DEFAULT_AI_GYRO_SCALE inside eskf_nhc
-        ai_confidence=conf_ai_full[sl],    # clipped to [DEFAULT_AI_CONF_MIN, DEFAULT_AI_CONF_MAX] inside eskf_nhc
+        gyro_correction=gyro_ai_full[sl],
+        ai_confidence=conf_ai_full[sl],
+        rv_measurement=rv_ai_full[sl] if rv_ai_full is not None else None,
+        q_scale=q_scale_full[sl] if q_scale_full is not None else None,
+        denoise_af=denoise_af_full[sl] if denoise_af_full is not None else None,
+        denoise_gz=denoise_gz_full[sl] if denoise_gz_full is not None else None,
     )
     m_ai = compute_metrics(x_ai, y_ai, x_gt, y_gt, dist_seg)
     
@@ -214,10 +221,17 @@ def run_full_stress_test(
         )
         with torch.no_grad():
             bx = torch.tensor(feat_win, dtype=torch.float32).to(device)
-            pred_vf, pred_gyro, pred_conf = model(bx)
-            vf_ai_full = pred_vf.squeeze(-1).cpu().numpy()
-            gyro_ai_full = pred_gyro.squeeze(-1).cpu().numpy()
-            conf_ai_full = pred_conf.squeeze(-1).cpu().numpy()
+            pred_denoise, pred_motion, pred_covar = model(bx)
+            denoise_af_full = pred_denoise[:, 0].cpu().numpy()
+            denoise_gz_full = pred_denoise[:, 1].cpu().numpy()
+            vf_ai_full = pred_motion[:, 0].cpu().numpy()
+            gyro_ai_full = pred_motion[:, 1].cpu().numpy()
+            log_var_v = pred_covar[:, 0].cpu().numpy()
+            log_var_q = pred_covar[:, 1].cpu().numpy()
+            
+            rv_ai_full = np.exp(log_var_v)
+            q_scale_full = np.exp(log_var_q)
+            conf_ai_full = np.clip(1.0 / (1.0 + np.exp(0.5 * log_var_v)), 0.1, 0.95)
             
         n_samples = len(drive.t)
         np.random.seed(42 + hash(d_id) % 1000)
@@ -251,6 +265,10 @@ def run_full_stress_test(
                     drive, s_idx, outage_len,
                     vf_ai_full, gyro_ai_full, conf_ai_full,
                     matcher,
+                    rv_ai_full=rv_ai_full,
+                    q_scale_full=q_scale_full,
+                    denoise_af_full=denoise_af_full,
+                    denoise_gz_full=denoise_gz_full,
                 )
                 if res is None:
                     continue

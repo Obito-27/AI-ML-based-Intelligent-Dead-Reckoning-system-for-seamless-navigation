@@ -51,6 +51,9 @@ class SensorCollector(private val context: Context) : SensorEventListener, Locat
     var lastGpsTimestampMs: Long = 0L
         private set
 
+    var compassHeadingDeg: Float = 0f
+        private set
+
     private var isLocationRegistered: Boolean = false
 
     fun start() {
@@ -76,6 +79,13 @@ class SensorCollector(private val context: Context) : SensorEventListener, Locat
 
             // 4. Gyroscope
             sm.getDefaultSensor(Sensor.TYPE_GYROSCOPE)?.let {
+                sm.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
+            }
+
+            // 5. Rotation Vector / Compass for rock-solid physical orientation without random spinning
+            val rotSensor = sm.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+                ?: sm.getDefaultSensor(Sensor.TYPE_GEOMAGNETIC_ROTATION_VECTOR)
+            rotSensor?.let {
                 sm.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
             }
         }
@@ -141,7 +151,10 @@ class SensorCollector(private val context: Context) : SensorEventListener, Locat
     }
 
     fun refreshLocation() {
-        isLocationRegistered = false
+        try {
+            isLocationRegistered = false
+            locationManager?.removeUpdates(this)
+        } catch (_: SecurityException) {}
         tryStartLocation()
     }
 
@@ -179,6 +192,7 @@ class SensorCollector(private val context: Context) : SensorEventListener, Locat
                             linearAcc[2] = event.values[2] - gravity[2]
                         }
                     }
+
                 }
             }
             Sensor.TYPE_GRAVITY -> {
@@ -197,6 +211,16 @@ class SensorCollector(private val context: Context) : SensorEventListener, Locat
                     hasGyroSample = true
                 }
             }
+            Sensor.TYPE_ROTATION_VECTOR, Sensor.TYPE_GEOMAGNETIC_ROTATION_VECTOR -> {
+                try {
+                    val rotMatrix = FloatArray(9)
+                    SensorManager.getRotationMatrixFromVector(rotMatrix, event.values)
+                    val orientation = FloatArray(3)
+                    SensorManager.getOrientation(rotMatrix, orientation)
+                    val deg = ((Math.toDegrees(orientation[0].toDouble()) + 360.0) % 360.0).toFloat()
+                    compassHeadingDeg = deg
+                } catch (_: Exception) {}
+            }
         }
     }
 
@@ -210,31 +234,49 @@ class SensorCollector(private val context: Context) : SensorEventListener, Locat
         }
     }
 
-    val isLocationHardwareEnabled: Boolean
+    val isGpsProviderEnabled: Boolean
         get() {
             val lm = locationManager ?: return false
             return try {
-                lm.isProviderEnabled(LocationManager.GPS_PROVIDER) ||
-                    lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
+                lm.isProviderEnabled(LocationManager.GPS_PROVIDER)
             } catch (_: Exception) { false }
         }
 
-    val isGpsActive: Boolean
+    val isNetworkProviderEnabled: Boolean
         get() {
-            if (!isLocationHardwareEnabled) return false
-            return (System.currentTimeMillis() - lastGpsTimestampMs) < 3000L && latestLocation != null
+            val lm = locationManager ?: return false
+            return try {
+                lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
+            } catch (_: Exception) { false }
         }
+
+    val isLocationHardwareEnabled: Boolean
+        get() = isGpsProviderEnabled || isNetworkProviderEnabled
+
+    val isGpsActive: Boolean
+        get() = isLocationHardwareEnabled && latestLocation != null
 
     @Deprecated("Deprecated in Java")
     override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
+
     override fun onProviderEnabled(provider: String) {
-        Log.i(TAG, "Location provider enabled: $provider")
+        Log.i(TAG, "Location provider enabled by system/user: $provider")
+        // Force an immediate tear-down and re-subscription across all active providers
         refreshLocation()
     }
+
     override fun onProviderDisabled(provider: String) {
-        Log.i(TAG, "Location provider disabled: $provider")
+        Log.i(TAG, "Location provider disabled by system/user: $provider")
         if (!isLocationHardwareEnabled) {
-            isFreshGps = false
+            synchronized(this) {
+                latestLocation = null
+                isFreshGps = false
+            }
+            // Remove listeners until a provider is enabled again
+            try {
+                isLocationRegistered = false
+                locationManager?.removeUpdates(this)
+            } catch (_: SecurityException) {}
         }
     }
 }

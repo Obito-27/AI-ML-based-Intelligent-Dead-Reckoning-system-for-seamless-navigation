@@ -97,6 +97,10 @@ class ESKFFusion:
         vf_measurement: Optional[np.ndarray] = None,
         gyro_correction: Optional[np.ndarray] = None,
         ai_confidence: Optional[np.ndarray] = None,
+        rv_measurement: Optional[np.ndarray] = None,
+        q_scale: Optional[np.ndarray] = None,
+        denoise_af: Optional[np.ndarray] = None,
+        denoise_gz: Optional[np.ndarray] = None,
     ) -> Dict[str, np.ndarray]:
         n = len(t)
         dt = self.dt
@@ -122,12 +126,16 @@ class ESKFFusion:
         gyro_bias_hat = 0.0
         p_pos = 4.0
         q_pos = 0.05
+        p_vf = 1.0   # Forward velocity error covariance
+        q_vf = 2.0   # Forward velocity process noise (kinematic acceleration variance)
         
         for k in range(1, n):
             is_outage = False if gnss_outage_mask is None else bool(gnss_outage_mask[k])
             has_fresh_gnss = bool(gps_fresh[k]) and not is_outage
 
-            raw_omega = gyro_z[k]
+            # Head 1: Denoise IMU inputs if predictions are supplied
+            clean_af = a_f[k] - 0.25 * (denoise_af[k] if denoise_af is not None else 0.0)
+            raw_omega = gyro_z[k] - 0.25 * (denoise_gz[k] if denoise_gz is not None else 0.0)
             if gyro_correction is not None:
                 raw_omega = raw_omega - gyro_correction[k]
                 
@@ -135,21 +143,34 @@ class ESKFFusion:
             psi[k] = psi[k - 1] + omega_corrected * dt
 
             # Zero-Velocity Detection (ZUPT)
-            lin_acc_mag = float(np.hypot(a_f[k], a_l[k]))
+            lin_acc_mag = float(np.hypot(clean_af, a_l[k]))
             gyro_mag = float(abs(omega_corrected))
             has_speed = gps_speed is not None and len(gps_speed) > k
             g_spd = float(gps_speed[k]) if (has_speed and has_fresh_gnss) else None
             is_stat = self.is_stationary(lin_acc_mag, gyro_mag, vf[k - 1], g_spd)
 
+            # Context-dependent process noise scaling (Head 3)
+            q_scale_k = float(q_scale[k]) if q_scale is not None else 1.0
+            q_scale_k = float(np.clip(q_scale_k, 0.1, 10.0))
+
             if is_stat:
                 vf[k] = 0.0
                 vl[k] = 0.0
+                p_vf = 0.01  # Tight certainty when stationary
             else:
+                vf_raw = vf[k - 1] + (clean_af + omega_corrected * vl[k - 1]) * dt
+                p_vf += q_vf * q_scale_k * dt
+                
                 if vf_measurement is None:
-                    vf_pred = vf[k - 1] + (a_f[k] + omega_corrected * vl[k - 1]) * dt
+                    vf_pred = vf_raw
+                elif rv_measurement is not None:
+                    # Brossard et al. AI-IMU Kalman measurement update with learned heteroscedastic covariance
+                    r_v = float(np.clip(rv_measurement[k], 0.01, 50.0))
+                    k_v = p_vf / (p_vf + r_v)
+                    vf_pred = vf_raw + k_v * (vf_measurement[k] - vf_raw)
+                    p_vf = (1.0 - k_v) * p_vf
                 else:
                     conf = 0.85 if ai_confidence is None else np.clip(ai_confidence[k], 0.1, 0.95)
-                    vf_raw = vf[k - 1] + (a_f[k] + omega_corrected * vl[k - 1]) * dt
                     vf_pred = (1.0 - conf) * vf_raw + conf * vf_measurement[k]
                     
                 vl_pred = vl[k - 1] + (a_l[k] - omega_corrected * vf[k - 1]) * dt
@@ -176,7 +197,7 @@ class ESKFFusion:
             
             x_pred = x[k - 1] + vx[k] * dt
             y_pred = y[k - 1] + vy[k] * dt
-            p_pos += q_pos
+            p_pos += q_pos * q_scale_k
             
             is_outage = False if gnss_outage_mask is None else bool(gnss_outage_mask[k])
             has_fresh_gnss = bool(gps_fresh[k]) and not is_outage
@@ -221,6 +242,10 @@ def eskf_nhc(
     ai_gyro_scale: float = DEFAULT_AI_GYRO_SCALE,
     ai_conf_min: float = DEFAULT_AI_CONF_MIN,
     ai_conf_max: float = DEFAULT_AI_CONF_MAX,
+    rv_measurement: Optional[np.ndarray] = None,
+    q_scale: Optional[np.ndarray] = None,
+    denoise_af: Optional[np.ndarray] = None,
+    denoise_gz: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     engine = ESKFFusion(k_nhc=k_nhc, k_gyrobias=k_gyrobias)
     if hasattr(sc, "t"):
@@ -285,5 +310,9 @@ def eskf_nhc(
         vf_measurement=vf_measurement,
         gyro_correction=scaled_gyro_corr,
         ai_confidence=clipped_conf,
+        rv_measurement=rv_measurement,
+        q_scale=q_scale,
+        denoise_af=denoise_af,
+        denoise_gz=denoise_gz,
     )
     return res["x"], res["y"], res["vf"]

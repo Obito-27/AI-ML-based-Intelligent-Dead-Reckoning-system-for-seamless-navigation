@@ -80,13 +80,21 @@ def test_model_output_ranges():
     model = DracarysMotionNet()
     model.eval()
     x = torch.randn(8, WINDOW_SIZE, NUM_FEATURES)
-    vf, gyro, conf = model(x)
+    denoise, motion, covar = model(x)
     
+    # Head 1: Denoise residuals (delta_af, delta_gz)
+    assert denoise.shape == (8, 2)
+    # Head 2: Motion state (vf >= 0, delta_gyro)
+    assert motion.shape == (8, 2)
+    assert (motion[:, 0] >= 0.0).all()  # Velocity non-negative
+    # Head 3: Learned covariance log-variances (log_var_v, log_var_q)
+    assert covar.shape == (8, 2)
+    assert (covar >= -4.0).all() and (covar <= 4.0).all()
+    
+    # Legacy wrapper test
+    vf, gyro, conf = model.predict_legacy(x)
     assert vf.shape == (8, 1)
     assert gyro.shape == (8, 1)
     assert conf.shape == (8, 1)
-    
-    # Velocity must be non-negative
     assert (vf >= 0.0).all()
-    # Confidence must be bounded in [0.1, 0.95]
     assert (conf >= 0.1).all() and (conf <= 0.95).all()

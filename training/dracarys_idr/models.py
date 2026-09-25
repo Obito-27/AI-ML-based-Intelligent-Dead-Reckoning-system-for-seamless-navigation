@@ -96,39 +96,40 @@ class DracarysMotionNet(nn.Module):
             batch_first=True,
         )
         
-        # Output Heads
-        # 1. Forward Speed Head (m/s)
-        self.head_vf = nn.Sequential(
+        # Output Heads (3 Explicit Heads per AI-IMU Brossard et al. Architecture)
+        # Head 1: IMU Denoising Head [delta_af, delta_gz] (residuals to filter vibration & sensor noise)
+        self.head_denoise = nn.Sequential(
             nn.Linear(gru_hidden, 24),
             nn.ReLU(),
-            nn.Linear(24, 1),
+            nn.Linear(24, 2),
         )
         
-        # 2. Heading Rate / Gyro Correction Head (rad/s)
-        self.head_gyro = nn.Sequential(
+        # Head 2: Motion State Regression Head [vf, delta_gyro]
+        self.head_motion = nn.Sequential(
             nn.Linear(gru_hidden, 24),
             nn.ReLU(),
-            nn.Linear(24, 1),
+            nn.Linear(24, 2),
         )
         
-        # 3. Confidence Head (bounded between 0.1 and 0.95)
-        self.head_conf = nn.Sequential(
-            nn.Linear(gru_hidden, 16),
+        # Head 3: Context-Aware Uncertainty / Covariance Head [log_var_v, log_var_q]
+        self.head_uncertainty = nn.Sequential(
+            nn.Linear(gru_hidden, 24),
             nn.ReLU(),
-            nn.Linear(16, 1),
-            nn.Sigmoid(),
+            nn.Linear(24, 2),
         )
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward pass over strictly trailing window.
         
         Args:
             x: Tensor of shape (B, win_size, in_features)
             
         Returns:
-            vf: (B, 1) predicted forward velocity (m/s)
-            delta_gyro: (B, 1) predicted yaw rate correction (rad/s)
-            confidence: (B, 1) confidence score in [0.1, 0.95]
+            denoise: (B, 2) predicted [delta_af, delta_gz] IMU residuals
+            motion: (B, 2) predicted [vf (m/s >= 0), delta_gyro (rad/s)]
+            covar: (B, 2) predicted [log_var_v (Rv = exp(s_v)), log_var_q (Q_scale = exp(s_q))]
         """
         # Permute for 1D convolution: (B, C, L)
         x_c = x.permute(0, 2, 1)
@@ -139,13 +140,36 @@ class DracarysMotionNet(nn.Module):
         h_seq = h.permute(0, 2, 1)
         gru_out, _ = self.gru(h_seq)
         
-        # Take representation at latest time step (current sample)
+        # Take representation at latest time step (current sample k)
         curr_feat = gru_out[:, -1, :]
         
-        vf = self.relu(self.head_vf(curr_feat))  # Speed is non-negative
-        delta_gyro = self.head_gyro(curr_feat)
-        conf = 0.1 + 0.85 * self.head_conf(curr_feat)
+        # Head 1: Denoising residuals
+        denoise = self.head_denoise(curr_feat)
         
+        # Head 2: Motion state
+        raw_motion = self.head_motion(curr_feat)
+        vf = self.relu(raw_motion[:, 0:1])  # Forward speed is strictly non-negative
+        delta_gyro = raw_motion[:, 1:2]
+        motion = torch.cat([vf, delta_gyro], dim=-1)
+        
+        # Head 3: Learned covariance log-variances (clamped for numerical stability)
+        raw_covar = self.head_uncertainty(curr_feat)
+        log_var_v = torch.clamp(raw_covar[:, 0:1], min=-4.0, max=4.0)
+        log_var_q = torch.clamp(raw_covar[:, 1:2], min=-4.0, max=4.0)
+        covar = torch.cat([log_var_v, log_var_q], dim=-1)
+        
+        return denoise, motion, covar
+
+    def predict_legacy(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Legacy-compatible tuple output: (vf, delta_gyro, confidence)."""
+        denoise, motion, covar = self.forward(x)
+        vf = motion[:, 0:1]
+        delta_gyro = motion[:, 1:2]
+        log_var_v = covar[:, 0:1]
+        # Derived confidence score in [0.1, 0.95] from measurement variance
+        conf = torch.clamp(1.0 / (1.0 + torch.exp(0.5 * log_var_v)), 0.1, 0.95)
         return vf, delta_gyro, conf
 
     def get_model_size_mb(self) -> float:

@@ -80,7 +80,7 @@ fun MapViewComposable(
                 }
             }
         } catch (_: Exception) {}
-        point ?: GeoPoint(20.5937, 78.9629) // Generic fallback until location fix
+        point
     }
 
     val mapView = remember {
@@ -94,6 +94,13 @@ fun MapViewComposable(
         // Universal MapTileProvider with online worldwide tile download + local cache
         val tileProvider = MapTileProviderBasic(context, TileSourceFactory.MAPNIK)
 
+        val trailPolyline = org.osmdroid.views.overlay.Polyline().apply {
+            outlinePaint.color = android.graphics.Color.parseColor("#14B8A6")
+            outlinePaint.strokeWidth = 10f
+            outlinePaint.strokeCap = android.graphics.Paint.Cap.ROUND
+            outlinePaint.strokeJoin = android.graphics.Paint.Join.ROUND
+        }
+
         MapView(context, tileProvider).apply {
             setTileSource(TileSourceFactory.MAPNIK)
             setMultiTouchControls(true)
@@ -101,12 +108,25 @@ fun MapViewComposable(
             isTilesScaledToDpi = true
             minZoomLevel = 3.0
             maxZoomLevel = 20.0
-            controller.setZoom(16.0)
+            controller.setZoom(17.0)
+
+            overlays.add(trailPolyline)
 
             // Center on real device position
-            val startLat = if (state.latitude != 0.0) state.latitude else initialGeoPoint.latitude
-            val startLon = if (state.longitude != 0.0) state.longitude else initialGeoPoint.longitude
-            controller.setCenter(GeoPoint(startLat, startLon))
+            val startLat = if (state.latitude != 0.0) state.latitude else initialGeoPoint?.latitude
+            val startLon = if (state.longitude != 0.0) state.longitude else initialGeoPoint?.longitude
+            if (startLat != null && startLon != null && startLat != 0.0 && startLon != 0.0) {
+                controller.setCenter(GeoPoint(startLat, startLon))
+            }
+
+            addOnFirstLayoutListener { _, _, _, _, _ ->
+                val targetLat = if (state.latitude != 0.0) state.latitude else initialGeoPoint?.latitude
+                val targetLon = if (state.longitude != 0.0) state.longitude else initialGeoPoint?.longitude
+                if (targetLat != null && targetLon != null && targetLat != 0.0 && targetLon != 0.0) {
+                    controller.setZoom(17.0)
+                    controller.setCenter(GeoPoint(targetLat, targetLon))
+                }
+            }
         }
     }
 
@@ -129,11 +149,32 @@ fun MapViewComposable(
             modifier = Modifier.fillMaxSize(),
             update = { view ->
                 if (state.latitude != 0.0 && state.longitude != 0.0) {
-                    val currentCenter = view.mapCenter
-                    val latDiff = Math.abs(currentCenter.latitude - state.latitude)
-                    val lonDiff = Math.abs(currentCenter.longitude - state.longitude)
-                    if (latDiff > 1.5e-5 || lonDiff > 1.5e-5 || currentCenter.latitude == 0.0) {
-                        view.controller.setCenter(GeoPoint(state.latitude, state.longitude))
+                    view.post {
+                        val currentCenter = view.mapCenter
+                        val latDiff = Math.abs(currentCenter.latitude - state.latitude)
+                        val lonDiff = Math.abs(currentCenter.longitude - state.longitude)
+                        if (latDiff > 3.5e-5 || lonDiff > 3.5e-5 || currentCenter.latitude == 0.0) {
+                            view.controller.setCenter(GeoPoint(state.latitude, state.longitude))
+                        }
+
+                        // Update native breadcrumb polyline on actual OpenStreetMap geography
+                        val trailOverlay = view.overlays.filterIsInstance<org.osmdroid.views.overlay.Polyline>().firstOrNull()
+                        if (trailOverlay != null) {
+                            if (state.recentTrail.size >= 2) {
+                                val pts = state.recentTrail.map { GeoPoint(it.first, it.second) }
+                                trailOverlay.setPoints(pts)
+                                val colorInt = when (state.mode) {
+                                    NavigationMode.Gnss -> android.graphics.Color.parseColor("#14B8A6")
+                                    NavigationMode.Fused -> android.graphics.Color.parseColor("#F59E0B")
+                                    NavigationMode.DeadReckoning -> android.graphics.Color.parseColor("#8B5CF6")
+                                    NavigationMode.AcquiringGps -> android.graphics.Color.parseColor("#6B7280")
+                                }
+                                trailOverlay.outlinePaint.color = colorInt
+                            } else {
+                                trailOverlay.setPoints(emptyList())
+                            }
+                            view.invalidate()
+                        }
                     }
                 }
             }
@@ -144,11 +185,8 @@ fun MapViewComposable(
             val cx = size.width / 2f
             val cy = size.height / 2f
 
-            // Breadcrumb trail
-            drawTrailingPath(cx = cx, cy = cy, state = state)
-
-            // Uncertainty corridor during Dead Reckoning
-            if (state.mode == NavigationMode.DeadReckoning) {
+            // Uncertainty corridor during Dead Reckoning (only when moving to prevent clutter)
+            if (state.mode == NavigationMode.DeadReckoning && state.distanceToLastFixM >= 3f) {
                 drawDeadReckoningCorridor(cx = cx, cy = cy, state = state)
             }
 
@@ -192,46 +230,6 @@ fun MapViewComposable(
             )
         }
     }
-}
-
-/**
- * Renders the trailing breadcrumb polyline of the last 60 positions.
- */
-private fun DrawScope.drawTrailingPath(cx: Float, cy: Float, state: NavigationState) {
-    val trail = state.recentTrail
-    if (trail.size < 2) return
-
-    val scalePxPerDeg = 80000f
-    val path = Path()
-    val lastLat = state.latitude
-    val lastLon = state.longitude
-
-    if (lastLat == 0.0 && lastLon == 0.0) return
-
-    var first = true
-    for (pt in trail) {
-        val dx = ((pt.second - lastLon) * scalePxPerDeg).toFloat()
-        val dy = (-(pt.first - lastLat) * scalePxPerDeg).toFloat()
-        val px = cx + dx
-        val py = cy + dy
-
-        if (first) {
-            path.moveTo(px, py)
-            first = false
-        } else {
-            path.lineTo(px, py)
-        }
-    }
-
-    drawPath(
-        path = path,
-        color = state.mode.color.copy(alpha = 0.80f),
-        style = Stroke(
-            width = 4.dp.toPx(),
-            cap = StrokeCap.Round,
-            join = StrokeJoin.Round,
-        ),
-    )
 }
 
 /**

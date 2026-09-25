@@ -185,6 +185,31 @@ fun SensorDiagnosticDialog(
                     valueColor = Color(0xFF38BDF8)
                 )
                 TelemetryRow(
+                    "GPS Providers",
+                    String.format(
+                        Locale.US, "GPS: %s | NET: %s",
+                        if (state.isGpsProviderEnabled) "ON" else "OFF",
+                        if (state.isNetworkProviderEnabled) "ON" else "OFF"
+                    ),
+                    valueColor = if (state.isGpsProviderEnabled) Color(0xFF4ADE80) else Color(0xFFEF4444)
+                )
+                TelemetryRow(
+                    "Raw Fix (Lat/Lon)",
+                    if (state.rawGpsLat != 0.0 || state.rawGpsLon != 0.0)
+                        String.format(Locale.US, "%.5f, %.5f", state.rawGpsLat, state.rawGpsLon)
+                    else "NO FIX",
+                    valueColor = if (state.rawGpsLat != 0.0) Color.White else Color(0xFFFBBF24)
+                )
+                TelemetryRow(
+                    "Accuracy / Provider",
+                    String.format(
+                        Locale.US, "±%.1fm (%s)",
+                        state.rawGpsAccuracyM,
+                        state.gpsProvider
+                    ),
+                    valueColor = if (state.rawGpsAccuracyM in 0.01f..25.0f) Color(0xFF4ADE80) else Color(0xFF94A3B8)
+                )
+                TelemetryRow(
                     "GPS Speed / Sats",
                     String.format(Locale.US, "%.1f m/s (%d sats)", state.gpsSpeed, state.gpsSats)
                 )

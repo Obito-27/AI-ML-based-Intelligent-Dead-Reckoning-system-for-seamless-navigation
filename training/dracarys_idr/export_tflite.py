@@ -67,7 +67,7 @@ def export_custom_model_binary(
         "model_name": "DracarysMotionNet",
         "format": "DRACARYS_CUSTOM_BIN_V1",
         "input_shape": [1, WINDOW_SIZE, NUM_FEATURES],
-        "outputs": ["predicted_velocity", "gyro_correction", "confidence"],
+        "outputs": ["denoise_imu", "motion_state", "uncertainty_covar"],
         "tensors": tensor_meta,
     }, indent=2).encode("utf-8")
     

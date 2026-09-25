@@ -94,6 +94,7 @@ class LiveNavigationRepository(
     private var prevGpsTimeMs: Long = 0L
     private val trailBuffer = mutableListOf<Pair<Double, Double>>()
     private var lastStableHeadingDeg: Float = 0f
+    private var forwardAccelAccum: Double = 0.0
 
     init {
         // Forward outage validator updates to repo interface
@@ -127,19 +128,27 @@ class LiveNavigationRepository(
     private fun startPipeline() {
         loopJob = scope.launch {
             var lastTickTime = System.currentTimeMillis()
+            var nextTickTime = System.currentTimeMillis()
             var previousMode: NavigationMode? = null
             var lastGpsRetryMs = 0L
 
             while (isActive) {
                 try {
-                    delay(100L) // 10 Hz tick
+                    nextTickTime += 100L
                     val now = System.currentTimeMillis()
-                    val dt = max(0.01, (now - lastTickTime) / 1000.0)
-                    lastTickTime = now
+                    val delayMs = max(0L, nextTickTime - now)
+                    if (delayMs > 0L) {
+                        delay(delayMs)
+                    } else if (now - nextTickTime > 500L) {
+                        nextTickTime = now
+                    }
+                    val tickNow = System.currentTimeMillis()
+                    val dt = max(0.01, (tickNow - lastTickTime) / 1000.0)
+                    lastTickTime = tickNow
 
                     // If still waiting for initial GPS lock, retry starting providers gently
-                    if (sensorCollector.latestLocation == null && (now - lastGpsRetryMs > 5000L)) {
-                        lastGpsRetryMs = now
+                    if (sensorCollector.latestLocation == null && (tickNow - lastGpsRetryMs > 5000L)) {
+                        lastGpsRetryMs = tickNow
                         sensorCollector.tryStartLocation()
                     }
 
@@ -169,26 +178,48 @@ class LiveNavigationRepository(
 
                     // 2. Calibrate orientation & project vehicle axes
                     val (af, al, az) = calibrator.projectVehicleBodyAccel(aDev, gDev)
-                    val vehicleHeadingRate = calibrator.extractVehicleHeadingRate(gyroDev, gDev)
+                    val vehicleYawRate = calibrator.extractVehicleYawRate(gyroDev, gDev)
 
                     // 3. Zero-Velocity Detection (ZUPT)
                     val linAccMag = hypot(hypot(aDev[0], aDev[1]), aDev[2])
                     val gyroMag = hypot(hypot(gyroDev[0], gyroDev[1]), gyroDev[2])
                     val loc = sensorCollector.latestLocation
                     val isGpsFresh = sensorCollector.isFreshGps
-                    val isOutageActive = _isDebugOutageActive.value
-                    val isGpsActive = sensorCollector.isGpsActive && !isOutageActive
-                    val gpsSpeed = if (loc != null && loc.hasSpeed() && isGpsFresh && isGpsActive) loc.speed.toDouble() else null
+                    val isManualOutage = _isDebugOutageActive.value
+                    val isHardwareLocationOn = sensorCollector.isLocationHardwareEnabled
+                    val isTunnelOutage = fusion.vf > 1.5 && (now - lastFixTimestampMs) > 4000L
+                    val isOutageActive = isManualOutage || !isHardwareLocationOn || isTunnelOutage
+
+                    val isVehicleSpeed = prevGpsSpeedMs >= 3.5 || fusion.vf >= 3.5 || forwardAccelAccum > 0.60
+
+                    // Track sustained forward acceleration to distinguish real vehicle motion from hand tremors
+                    if (af > 0.45) {
+                        forwardAccelAccum = min(3.0, forwardAccelAccum + af * dt)
+                    } else {
+                        forwardAccelAccum = max(0.0, forwardAccelAccum - 2.0 * dt)
+                    }
+
+                    // Strict Zero-Acceleration and Stationary Detection
+                    // When the device is resting or acceleration is near zero, motion must completely cease.
+                    val isNearZeroAccel = linAccMag < 0.28 && kotlin.math.abs(af) < 0.22 && kotlin.math.abs(al) < 0.22
+                    val isNearZeroGyro = gyroMag < 0.08
+                    val isPhysicallyResting = isNearZeroAccel && isNearZeroGyro
+
+                    val isVehicleMoving = if (isPhysicallyResting && forwardAccelAccum < 0.15) {
+                        false
+                    } else {
+                        (isVehicleSpeed && fusion.vf > 0.30) || forwardAccelAccum > 0.40
+                    }
 
                     val isStationary = when {
-                        gpsSpeed != null && gpsSpeed < 0.25 -> true
-                        linAccMag < 0.40 && gyroMag < 0.08 && fusion.vf < 0.50 -> true
-                        linAccMag < 0.20 && gyroMag < 0.03 -> true
+                        !isVehicleMoving -> true
+                        isPhysicallyResting -> true
+                        linAccMag < 0.35 && gyroMag < 0.06 && fusion.vf < 0.50 -> true
                         else -> false
                     }
 
-                    // When physically stationary, adaptively learn zero-rate gyro bias
-                    if (isStationary) {
+                    // Adaptively learn zero-rate gyro bias ONLY when physically resting (gyro rate near zero)
+                    if (isPhysicallyResting) {
                         calibrator.updateStationaryGyroBias(gyroDev)
                     }
 
@@ -204,26 +235,40 @@ class LiveNavigationRepository(
                     val aiPrediction = motionNet.predict()
                     predictCallCount++
 
-                    // Suppress neural network positive velocity bias if vehicle is stopped and not accelerating
-                    val aiVfInput = if (fusion.vf < 0.10 && af < 0.35) {
-                        0.0
+                    // 5. Predict step (Vehicle Dead Reckoning) with Zero-Acceleration freeze
+                    if (isStationary) {
+                        // ZERO ACCELERATION / ZERO MOTION STOP:
+                        // Ensure velocity and displacement increments are strictly clamped to zero
+                        fusion.vf = 0.0
+                        fusion.vl = 0.0
+                        fusion.vx = 0.0
+                        fusion.vy = 0.0
                     } else {
-                        aiPrediction.predictedVelocity
+                        // Vehicle Dead Reckoning (VDR)
+                        // Suppress neural network positive velocity bias if vehicle is not moving or acceleration is resting
+                        val aiVfInput = if (!isVehicleMoving || isPhysicallyResting) {
+                            0.0
+                        } else {
+                            aiPrediction.predictedVelocity
+                        }
+
+                        // ESKF predict step at 10 Hz with learned Brossard et al. Kalman covariance & denoising
+                        fusion.predict(
+                            af = af,
+                            al = al,
+                            gyroZ = vehicleYawRate,
+                            stepDt = dt,
+                            aiVf = aiVfInput,
+                            aiGyroCorr = aiPrediction.gyroCorrection,
+                            aiConf = aiPrediction.confidence,
+                            isStationary = isStationary,
+                            aiRv = aiPrediction.measurementVarianceRv,
+                            aiQScale = aiPrediction.processVarianceScaleQ,
+                            denoiseAf = aiPrediction.denoisedAf,
+                            denoiseGz = aiPrediction.denoisedGz,
+                        )
+                        totalDistTraveled += fusion.vf * dt
                     }
-
-                    // 5. ESKF predict step at 10 Hz (ZUPT forces vf = vl = 0 and freezes heading)
-                    fusion.predict(
-                        af = af,
-                        al = al,
-                        gyroZ = vehicleHeadingRate,
-                        stepDt = dt,
-                        aiVf = aiVfInput,
-                        aiGyroCorr = aiPrediction.gyroCorrection,
-                        aiConf = aiPrediction.confidence,
-                        isStationary = isStationary,
-                    )
-
-                    totalDistTraveled += fusion.vf * dt
 
                     // 6. Detect outage toggle edge transitions
                     if (isOutageActive && !wasOutageActive) {
@@ -242,16 +287,21 @@ class LiveNavigationRepository(
                         currentConfidence = aiPrediction.confidence.toFloat(),
                     )
 
-                    // 7. Check for GNSS correction (suppressed when debug outage is active or GPS is inactive)
-                    if (loc != null && isGpsFresh && isGpsActive) {
+                    // 7. Check for GNSS correction
+                    // Incoming live GPS fixes are ALWAYS accepted when NOT in manual simulated outage!
+                    // This allows immediate recovery when exiting tunnels or turning GPS back on.
+                    if (loc != null && isGpsFresh && !isManualOutage) {
                         sensorCollector.isFreshGps = false
                         lastFixTimestampMs = now
 
                         val currentGpsSpeed = if (loc.hasSpeed()) loc.speed.toDouble() else 0.0
 
-                        if (loc.hasBearing() && (currentGpsSpeed > 0.5 || !loc.hasSpeed())) {
+                        if (loc.hasBearing() && currentGpsSpeed >= 1.2) {
                             lastStableHeadingDeg = loc.bearing
-                            fusion.psi = Math.toRadians(loc.bearing.toDouble())
+                            fusion.psi = (Math.PI / 2.0) - Math.toRadians(loc.bearing.toDouble())
+                        } else if (sensorCollector.compassHeadingDeg != 0f) {
+                            lastStableHeadingDeg = sensorCollector.compassHeadingDeg
+                            fusion.psi = (Math.PI / 2.0) - Math.toRadians(sensorCollector.compassHeadingDeg.toDouble())
                         }
 
                         // Feed in-motion mount azimuth calibration when moving (> 3.0 m/s)
@@ -279,8 +329,8 @@ class LiveNavigationRepository(
 
                         // Notify validator of GNSS reacquisition to evaluate real displacement gap
                         outageValidator.onGnssReacquired(0.0, 0.0)
-                    } else if (!isGpsActive && isGpsFresh) {
-                        // Suppress incoming live GPS updates during simulated outage or GPS inactive
+                    } else if (isManualOutage && isGpsFresh) {
+                        // Only suppress incoming GPS fixes if manual simulated outage switch is intentionally ON
                         sensorCollector.isFreshGps = false
                     }
 
@@ -291,9 +341,7 @@ class LiveNavigationRepository(
                     val timeSinceLastFixMs = if (lastFixTimestampMs == 0L) 0L else (now - lastFixTimestampMs)
                     val outageDurationSec = timeSinceLastFixMs / 1000L
 
-                    val isGnssAvailable = isGpsActive && loc != null && timeSinceLastFixMs < 3000L
-
-                    val distToLastFixM = if (isGnssAvailable || lastFixTimestampMs == 0L) {
+                    val distToLastFixM = if (!isOutageActive || lastFixTimestampMs == 0L) {
                         0f
                     } else {
                         hypot(matchedX - lastFixX, matchedY - lastFixY).toFloat()
@@ -306,48 +354,62 @@ class LiveNavigationRepository(
                     val curLon: Double
                     val currentHeadingDeg: Float
 
-                    if (refLat == null || lastFixTimestampMs == 0L) {
+                    if (loc == null && refLat == null) {
                         // Waiting for initial GPS lock on launch — neutral gray mode
                         mode = NavigationMode.AcquiringGps
                         confidence = 0.0f
                         driftPercent = 0.0f
-                        curLat = loc?.latitude ?: 0.0
-                        curLon = loc?.longitude ?: 0.0
-                        currentHeadingDeg = lastStableHeadingDeg
-                    } else if (isGnssAvailable) {
-                        val currentLoc = loc!!
-                        // GPS is ON and available: position is directly based on GPS!
+                        curLat = 0.0
+                        curLon = 0.0
+                        currentHeadingDeg = if (sensorCollector.compassHeadingDeg != 0f) sensorCollector.compassHeadingDeg else lastStableHeadingDeg
+                    } else if (!isOutageActive) {
+                        // Normal Navigation: position is ALWAYS the true device location!
                         mode = NavigationMode.Gnss
                         confidence = 0.98f
                         driftPercent = 0.0f
-                        curLat = currentLoc.latitude
-                        curLon = currentLoc.longitude
-                        currentHeadingDeg = if (currentLoc.hasBearing() && (currentLoc.speed > 0.5f || !currentLoc.hasSpeed())) {
-                            lastStableHeadingDeg = currentLoc.bearing
-                            currentLoc.bearing
+                        curLat = loc?.latitude ?: refLat ?: 0.0
+                        curLon = loc?.longitude ?: refLon ?: 0.0
+                        currentHeadingDeg = if (loc != null && loc.hasBearing() && (loc.hasSpeed() && loc.speed >= 1.2f)) {
+                            lastStableHeadingDeg = loc.bearing
+                            loc.bearing
+                        } else if (sensorCollector.compassHeadingDeg != 0f) {
+                            lastStableHeadingDeg = sensorCollector.compassHeadingDeg
+                            sensorCollector.compassHeadingDeg
                         } else {
                             lastStableHeadingDeg
                         }
+
+                        // Keep dead reckoning anchor continuously synced to current location
+                        if (loc != null) {
+                            refLat = loc.latitude
+                            refLon = loc.longitude
+                            lastFixX = 0.0
+                            lastFixY = 0.0
+                            fusion.x = 0.0
+                            fusion.y = 0.0
+                            if (loc.hasSpeed()) {
+                                fusion.vf = loc.speed.toDouble()
+                            }
+                            outageStartDist = totalDistTraveled
+                        }
                     } else {
-                        // GPS is OFF / lost (tunnel, settings off, debug outage): works through IMU sensors!
+                        // Outage active (simulated outage, location disabled, or driving tunnel outage):
+                        // Driven through IMU sensors (Dead Reckoning)!
                         val outageDist = max(0.0, totalDistTraveled - outageStartDist)
                         val sigmaPos = sqrt(max(0.01, fusion.pPos))
 
-                        // Physically meaningful drift percentage: (position uncertainty / distance traveled) * 100%
                         driftPercent = if (outageDist < 1.0) {
                             0.0f
                         } else {
                             ((sigmaPos / outageDist) * 100.0).toFloat().coerceIn(0.1f, 99.9f)
                         }
 
-                        // Confidence decays gracefully with accumulated position uncertainty
                         val decayFactor = exp(-min(10.0, sigmaPos / 40.0))
                         val baseConf = aiPrediction.confidence.toDouble().coerceIn(0.60, 0.95)
                         val effectiveConf = (baseConf * decayFactor).toFloat().coerceIn(0.15f, 0.95f)
                         confidence = effectiveConf
 
-                        mode = if (isOutageActive || !sensorCollector.isLocationHardwareEnabled) {
-                            // Enforce dead-reckoning mode with real sensors as source
+                        mode = if (isManualOutage || !isHardwareLocationOn) {
                             NavigationMode.DeadReckoning
                         } else if (effectiveConf >= 0.70f) {
                             NavigationMode.Fused
@@ -355,20 +417,44 @@ class LiveNavigationRepository(
                             NavigationMode.DeadReckoning
                         }
 
-                        // Compute dead-reckoned coordinates from IMU filter relative to last known GPS fix
-                        val (drLat, drLon) = enuToGeodetic(matchedX, matchedY, refLat!!, refLon!!)
+                        val (drLat, drLon) = if (refLat != null && refLon != null) {
+                            enuToGeodetic(matchedX, matchedY, refLat!!, refLon!!)
+                        } else if (loc != null) {
+                            Pair(loc.latitude, loc.longitude)
+                        } else {
+                            Pair(0.0, 0.0)
+                        }
                         curLat = drLat
                         curLon = drLon
-                        currentHeadingDeg = Math.toDegrees(fusion.psi).toFloat()
+                        currentHeadingDeg = if (isStationary) {
+                            if (sensorCollector.compassHeadingDeg != 0f) {
+                                lastStableHeadingDeg = sensorCollector.compassHeadingDeg
+                                sensorCollector.compassHeadingDeg
+                            } else {
+                                lastStableHeadingDeg
+                            }
+                        } else {
+                            val deg = ((90.0 - Math.toDegrees(fusion.psi)) % 360.0 + 360.0) % 360.0
+                            lastStableHeadingDeg = deg.toFloat()
+                            deg.toFloat()
+                        }
                     }
 
                     // Update breadcrumb trail
                     if (curLat != 0.0 && curLon != 0.0) {
                         synchronized(trailBuffer) {
                             val lastPt = trailBuffer.lastOrNull()
-                            if (lastPt == null || hypot((curLat - lastPt.first) * 111000.0, (curLon - lastPt.second) * 85000.0) > 1.0) {
+                            if (lastPt == null) {
                                 trailBuffer.add(Pair(curLat, curLon))
-                                if (trailBuffer.size > 60) trailBuffer.removeAt(0)
+                            } else {
+                                val distM = hypot((curLat - lastPt.first) * 111000.0, (curLon - lastPt.second) * 85000.0)
+                                if (distM > 50.0) {
+                                    trailBuffer.clear()
+                                    trailBuffer.add(Pair(curLat, curLon))
+                                } else if (distM >= 1.5) {
+                                    trailBuffer.add(Pair(curLat, curLon))
+                                    if (trailBuffer.size > 60) trailBuffer.removeAt(0)
+                                }
                             }
                         }
                     }
@@ -391,7 +477,7 @@ class LiveNavigationRepository(
                         gyro = gyroDev,
                         uUp = uUp,
                         mountAzimuthDeg = Math.toDegrees(calibrator.psiMount),
-                        vehicleYawRate = vehicleHeadingRate,
+                        vehicleYawRate = vehicleYawRate,
                         af = af,
                         al = al,
                         az = az,
@@ -421,7 +507,7 @@ class LiveNavigationRepository(
                         rawGyro = floatArrayOf(gyroDev[0].toFloat(), gyroDev[1].toFloat(), gyroDev[2].toFloat()),
                         rawGravity = floatArrayOf(gDev[0].toFloat(), gDev[1].toFloat(), gDev[2].toFloat()),
                         uUp = uUp,
-                        vehicleYawRate = vehicleHeadingRate,
+                        vehicleYawRate = vehicleYawRate,
                         af = af,
                         al = al,
                         az = az,
@@ -439,6 +525,12 @@ class LiveNavigationRepository(
                         gpsSpeed = if (loc?.hasSpeed() == true) loc.speed.toDouble() else 0.0,
                         gpsSats = loc?.extras?.getInt("satellites", 0) ?: 0,
                         hasFreshGps = (loc != null && !isOutageActive),
+                        rawGpsLat = loc?.latitude ?: 0.0,
+                        rawGpsLon = loc?.longitude ?: 0.0,
+                        rawGpsAccuracyM = loc?.accuracy ?: 0f,
+                        gpsProvider = loc?.provider ?: "none",
+                        isGpsProviderEnabled = sensorCollector.isGpsProviderEnabled,
+                        isNetworkProviderEnabled = sensorCollector.isNetworkProviderEnabled,
                     )
 
                     _state.value = NavigationState(

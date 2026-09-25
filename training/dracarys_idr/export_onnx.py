@@ -53,7 +53,7 @@ def export_to_onnx(
         opset_version=18,
         dynamic_shapes={"x": {0: batch_dim}},
         input_names=["imu_window"],
-        output_names=["predicted_velocity", "gyro_correction", "confidence"],
+        output_names=["denoise_imu", "motion_state", "uncertainty_covar"],
     )
     
     size_mb = output_path.stat().st_size / (1024.0 * 1024.0)
@@ -71,7 +71,7 @@ def export_to_onnx(
     
     print(f"ONNX Runtime validation passed.")
     print(f"Average CPU inference latency: {avg_latency_ms:.3f} ms (Target < 5 ms for 200 Hz edge engine)")
-    print(f"Outputs: vf={outputs[0][0,0]:.2f} m/s, delta_gyro={outputs[1][0,0]:.4f} rad/s, conf={outputs[2][0,0]:.2f}")
+    print(f"Outputs: denoise={outputs[0][0]}, motion={outputs[1][0]}, covar={outputs[2][0]}")
     
     return output_path
 

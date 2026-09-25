@@ -139,7 +139,7 @@ fun NavigationScreen(
                 }
             }
 
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
                 // Raw IMU / AI Diagnostic Screen Button
                 Box(
                     modifier = Modifier

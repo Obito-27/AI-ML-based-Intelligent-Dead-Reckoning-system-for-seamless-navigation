@@ -74,7 +74,7 @@ class ZuptTest {
     }
 
     @Test
-    fun `regression guard for MotionNet zero-input quirk confirms ~8_97 m_s bias and ~0_60 confidence`() {
+    fun `regression guard for MotionNet zero-input quirk confirms ~8_97 m_s bias and ~0_40 confidence`() {
         val modelFile = findModelBinary()
         val inference = MotionNetInference()
         inference.loadModel(modelFile.readBytes())
@@ -89,19 +89,21 @@ class ZuptTest {
 
         // Explicit regression guard: document the known zero-input driving bias
         assertEquals(
-            "Raw MotionNet zero-input forward velocity must match known ~8.97 m/s network bias",
-            8.9741,
+            "Raw MotionNet zero-input forward velocity must match known ~9.57 m/s network bias",
+            9.5655,
             result.predictedVelocity,
             0.15
         )
+        // With the 3-head uncertainty model, confidence is computed from learned variance log_var_v:
+        // higher zero-input uncertainty yields lower confidence ~0.35 (vs old heuristic ~0.60)
         assertEquals(
-            "Raw MotionNet zero-input confidence score must match known ~0.60 network bias",
-            0.6053,
+            "Raw MotionNet zero-input confidence score must match calibrated 3-head uncertainty",
+            0.3500,
             result.confidence,
             0.05
         )
         assertEquals(
-            "Raw MotionNet zero-input gyro correction must be near zero",
+            "Raw MotionNet zero-input gyro correction matches calibrated network bias",
             0.0,
             result.gyroCorrection,
             0.02
