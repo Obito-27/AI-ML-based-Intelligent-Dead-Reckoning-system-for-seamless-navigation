@@ -214,6 +214,44 @@ fun SensorDiagnosticDialog(
                     String.format(Locale.US, "%.1f m/s (%d sats)", state.gpsSpeed, state.gpsSats)
                 )
 
+                Spacer(modifier = Modifier.height(14.dp))
+
+                // 5. SOFT MAP MATCHING
+                DiagnosticSectionHeader("5. SOFT MAP MATCHING (SMM)")
+                TelemetryRow(
+                    "Road Segments Loaded",
+                    if (state.smmSegmentCount > 0) "${state.smmSegmentCount}" else "0 (NO DATA)",
+                    valueColor = if (state.smmSegmentCount > 0) Color(0xFF4ADE80) else Color(0xFFEF4444)
+                )
+                TelemetryRow(
+                    "Candidates This Tick",
+                    "${state.smmCandidateCount}",
+                    valueColor = if (state.smmCandidateCount > 0) Color(0xFF38BDF8) else Color(0xFF94A3B8)
+                )
+                TelemetryRow(
+                    "Nearest Candidate",
+                    if (state.smmNearestDistM >= 0) String.format(Locale.US, "%.1f m", state.smmNearestDistM) else "N/A",
+                    valueColor = if (state.smmNearestDistM in 0.0..35.0) Color(0xFF4ADE80)
+                        else if (state.smmNearestDistM > 35.0) Color(0xFFFBBF24)
+                        else Color(0xFF94A3B8)
+                )
+                TelemetryRow(
+                    "Correction Applied",
+                    String.format(Locale.US, "%.2f m", state.smmCorrectionM),
+                    valueColor = if (state.smmCorrectionM > 0.01) Color(0xFF38BDF8) else Color(0xFF94A3B8)
+                )
+                TelemetryRow(
+                    "Data Source",
+                    state.smmFetchStatus,
+                    valueColor = when {
+                        state.smmFetchStatus.startsWith("API_OK") -> Color(0xFF4ADE80)
+                        state.smmFetchStatus.startsWith("CACHE_HIT") -> Color(0xFF38BDF8)
+                        state.smmFetchStatus.startsWith("GPS_TRACE") -> Color(0xFFFBBF24)
+                        state.smmFetchStatus == "INIT" -> Color(0xFF94A3B8)
+                        else -> Color(0xFFEF4444)
+                    }
+                )
+
                 Spacer(modifier = Modifier.height(20.dp))
 
                 Button(

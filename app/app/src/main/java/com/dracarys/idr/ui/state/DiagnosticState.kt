@@ -33,6 +33,17 @@ data class DiagnosticState(
     val gpsProvider: String = "none",
     val isGpsProviderEnabled: Boolean = false,
     val isNetworkProviderEnabled: Boolean = false,
+    // ---- Soft Map Matching diagnostics ----
+    /** Total road segments loaded (0 = SMM is a no-op). */
+    val smmSegmentCount: Int = 0,
+    /** Number of candidate road segments found within the search corridor this tick. */
+    val smmCandidateCount: Int = 0,
+    /** Distance to the nearest candidate road segment (meters). -1 if none. */
+    val smmNearestDistM: Double = -1.0,
+    /** Magnitude of the correction vector actually applied (meters). */
+    val smmCorrectionM: Double = 0.0,
+    /** Road data source status (e.g. "API_OK", "CACHE_HIT", "GPS_TRACE", "INIT"). */
+    val smmFetchStatus: String = "INIT",
 ) {
     val accMag: Float
         get() = kotlin.math.sqrt(rawAcc[0] * rawAcc[0] + rawAcc[1] * rawAcc[1] + rawAcc[2] * rawAcc[2])

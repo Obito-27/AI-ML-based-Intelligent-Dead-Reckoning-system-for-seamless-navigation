@@ -36,6 +36,17 @@ class SoftMapMatcher(
 
     private var kdTree: KdTree2D? = null
 
+    // ---- Diagnostic state from last matchPoint() call ----
+    /** Number of candidate road segments found within the search corridor on the last tick. */
+    @Volatile var lastCandidateCount: Int = 0; private set
+    /** Perpendicular distance to the nearest candidate segment (meters) on the last tick. Double.MAX_VALUE if none. */
+    @Volatile var lastNearestDistM: Double = Double.MAX_VALUE; private set
+    /** Magnitude of the correction vector applied to the position (meters) on the last tick. */
+    @Volatile var lastCorrectionM: Double = 0.0; private set
+
+    /** Total number of road segments currently loaded. Zero means SMM is a no-op. */
+    val segmentCount: Int get() = p1List.size
+
     /**
      * Loads segments from a list of start/end pairs in ENU meters.
      */
@@ -60,12 +71,26 @@ class SoftMapMatcher(
         y: Double,
         headingRad: Double,
     ): Triple<Double, Double, Double> {
-        val tree = kdTree ?: return Triple(x, y, 0.0)
-        if (p1List.isEmpty()) return Triple(x, y, 0.0)
+        val tree = kdTree
+        if (tree == null) {
+            lastCandidateCount = 0
+            lastNearestDistM = Double.MAX_VALUE
+            lastCorrectionM = 0.0
+            return Triple(x, y, 0.0)
+        }
+        if (p1List.isEmpty()) {
+            lastCandidateCount = 0
+            lastNearestDistM = Double.MAX_VALUE
+            lastCorrectionM = 0.0
+            return Triple(x, y, 0.0)
+        }
 
         // Query segments within search corridor + margin
         val candIndices = tree.queryRadius(x, y, corridorM + 10.0)
         if (candIndices.isEmpty()) {
+            lastCandidateCount = 0
+            lastNearestDistM = Double.MAX_VALUE
+            lastCorrectionM = 0.0
             return Triple(x, y, 0.0)
         }
 
@@ -75,6 +100,8 @@ class SoftMapMatcher(
         var totalWeight = 0.0
         var targetX = 0.0
         var targetY = 0.0
+        var minDist = Double.MAX_VALUE
+        var candidatesInCorridor = 0
 
         for (idx in candIndices) {
             val p1 = p1List[idx]
@@ -100,7 +127,10 @@ class SoftMapMatcher(
             val distY = y - closestY
             val dist = sqrt(distX * distX + distY * distY)
 
+            if (dist < minDist) minDist = dist
+
             if (dist < corridorM) {
+                candidatesInCorridor++
                 val headingScore = max(0.1, abs(vehDirX * unitSegX + vehDirY * unitSegY))
                 val distProb = exp(-(dist * dist) / (2.0 * sigmaDist * sigmaDist))
                 val w = distProb * headingScore
@@ -111,7 +141,11 @@ class SoftMapMatcher(
             }
         }
 
+        lastCandidateCount = candidatesInCorridor
+        lastNearestDistM = if (minDist == Double.MAX_VALUE) Double.MAX_VALUE else minDist
+
         if (totalWeight < 1e-6) {
+            lastCorrectionM = 0.0
             return Triple(x, y, 0.0)
         }
 
@@ -120,6 +154,8 @@ class SoftMapMatcher(
 
         val pulledX = (1.0 - pullFactor) * x + pullFactor * avgTargetX
         val pulledY = (1.0 - pullFactor) * y + pullFactor * avgTargetY
+
+        lastCorrectionM = sqrt((pulledX - x) * (pulledX - x) + (pulledY - y) * (pulledY - y))
 
         return Triple(pulledX, pulledY, min(1.0, totalWeight))
     }

@@ -84,7 +84,8 @@ class DiagnosticLogger(private val context: Context) {
                 "fusion_vf", "fusion_vl", "fusion_vx", "fusion_vy",
                 "fusion_x", "fusion_y", "fusion_psi_rad", "gyro_bias_hat",
                 "zupt_active",
-                "has_gnss", "gps_lat", "gps_lon", "gps_speed_ms", "gps_sats", "gps_acc_m"
+                "has_gnss", "gps_lat", "gps_lon", "gps_speed_ms", "gps_sats", "gps_acc_m",
+                "smm_seg_count", "smm_candidates", "smm_nearest_m", "smm_correction_m"
             ).joinToString(",")
             w.write(header)
             w.newLine()
@@ -181,6 +182,10 @@ class DiagnosticLogger(private val context: Context) {
         gpsSpeed: Double,
         gpsSats: Int,
         gpsAccuracy: Double,
+        smmSegCount: Int = 0,
+        smmCandidates: Int = 0,
+        smmNearestM: Double = -1.0,
+        smmCorrectionM: Double = 0.0,
     ) {
         val now = System.currentTimeMillis()
         val elapsedSec = (now - startTimestampMs) / 1000.0
@@ -206,7 +211,8 @@ class DiagnosticLogger(private val context: Context) {
                     .append(String.format(Locale.US, "%.2f,%.2f,%.4f,%.6f,", fusionX, fusionY, fusionPsi, gyroBiasHat))
                     .append(if (zuptActive) "1" else "0").append(',')
                     .append(if (hasGnss) "1" else "0").append(',')
-                    .append(String.format(Locale.US, "%.6f,%.6f,%.2f,%d,%.1f", gpsLat, gpsLon, gpsSpeed, gpsSats, gpsAccuracy))
+                    .append(String.format(Locale.US, "%.6f,%.6f,%.2f,%d,%.1f,", gpsLat, gpsLon, gpsSpeed, gpsSats, gpsAccuracy))
+                    .append(String.format(Locale.US, "%d,%d,%.2f,%.3f", smmSegCount, smmCandidates, smmNearestM, smmCorrectionM))
                     .toString()
 
                 w.write(row)

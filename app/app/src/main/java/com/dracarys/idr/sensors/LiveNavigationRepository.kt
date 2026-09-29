@@ -3,6 +3,7 @@ package com.dracarys.idr.sensors
 import android.content.Context
 import com.dracarys.idr.calibration.DeviceOrientationCalibrator
 import com.dracarys.idr.fusion.ESKFFusion
+import com.dracarys.idr.mapmatch.OverpassRoadFetcher
 import com.dracarys.idr.mapmatch.SoftMapMatcher
 import com.dracarys.idr.ml.MotionNetInference
 import com.dracarys.idr.ui.state.NavigationMode
@@ -69,6 +70,12 @@ class LiveNavigationRepository(
     private val calibrator = DeviceOrientationCalibrator()
     private val fusion = ESKFFusion(dt = 0.10)
     private val mapMatcher = SoftMapMatcher()
+    private val roadFetcher = OverpassRoadFetcher(
+        cacheDir = java.io.File(
+            context.getExternalFilesDir("road_cache") ?: context.filesDir,
+            "roads"
+        )
+    )
     private val motionNet = MotionNetInference()
     private val diagnosticLogger = com.dracarys.idr.logging.DiagnosticLogger(context)
     private val outageValidator = com.dracarys.idr.logging.OutageValidator(context)
@@ -95,6 +102,11 @@ class LiveNavigationRepository(
     private val trailBuffer = mutableListOf<Pair<Double, Double>>()
     private var lastStableHeadingDeg: Float = 0f
     private var forwardAccelAccum: Double = 0.0
+
+    // GPS breadcrumb accumulator for SMM GPS-trace fallback
+    private val gpsBreadcrumbs = mutableListOf<Pair<Double, Double>>()
+    private var lastRoadFetchMs: Long = 0L
+    private var isRoadFetchInProgress: Boolean = false
 
     init {
         // Forward outage validator updates to repo interface
@@ -334,6 +346,65 @@ class LiveNavigationRepository(
                         sensorCollector.isFreshGps = false
                     }
 
+                    // 7.5. Proactive road data fetching for SMM
+                    val currentRefLat = refLat
+                    val currentRefLon = refLon
+                    if (currentRefLat != null && currentRefLon != null && !isRoadFetchInProgress) {
+                        val fetchLat = loc?.latitude ?: currentRefLat
+                        val fetchLon = loc?.longitude ?: currentRefLon
+
+                        // Accumulate GPS breadcrumbs for fallback self-matching
+                        if (loc != null && isGpsFresh) {
+                            val lastBc = gpsBreadcrumbs.lastOrNull()
+                            if (lastBc == null || kotlin.math.hypot(
+                                    (loc.latitude - lastBc.first) * 111000.0,
+                                    (loc.longitude - lastBc.second) * 85000.0
+                                ) >= 3.0
+                            ) {
+                                gpsBreadcrumbs.add(Pair(loc.latitude, loc.longitude))
+                                if (gpsBreadcrumbs.size > 500) gpsBreadcrumbs.removeAt(0)
+                            }
+                        }
+
+                        // Proactive fetch: re-fetch when vehicle moves outside cached area
+                        if (roadFetcher.needsRefetch(fetchLat, fetchLon)) {
+                            isRoadFetchInProgress = true
+                            scope.launch {
+                                try {
+                                    val segments = roadFetcher.fetchRoadSegments(
+                                        lat = fetchLat,
+                                        lon = fetchLon,
+                                        refLat = currentRefLat,
+                                        refLon = currentRefLon,
+                                    )
+                                    if (segments != null && segments.first.isNotEmpty()) {
+                                        mapMatcher.loadSegments(segments.first, segments.second)
+                                        android.util.Log.i(
+                                            "LiveNavRepo",
+                                            "SMM loaded ${segments.first.size} road segments (${roadFetcher.lastFetchStatus})"
+                                        )
+                                    } else if (gpsBreadcrumbs.size >= 5) {
+                                        // Fallback: use GPS trace self-matching
+                                        val traceSegments = roadFetcher.buildGpsTraceSegments(
+                                            gpsBreadcrumbs.toList(), currentRefLat, currentRefLon
+                                        )
+                                        if (traceSegments != null) {
+                                            mapMatcher.loadSegments(traceSegments.first, traceSegments.second)
+                                            android.util.Log.i(
+                                                "LiveNavRepo",
+                                                "SMM fallback: loaded ${traceSegments.first.size} GPS-trace segments"
+                                            )
+                                        }
+                                    }
+                                } catch (e: Exception) {
+                                    android.util.Log.w("LiveNavRepo", "Road fetch failed: ${e.message}")
+                                } finally {
+                                    isRoadFetchInProgress = false
+                                }
+                            }
+                        }
+                    }
+
                     // 8. Soft Map Match position
                     val (matchedX, matchedY, mapConf) = mapMatcher.matchPoint(fusion.x, fusion.y, fusion.psi)
 
@@ -500,6 +571,10 @@ class LiveNavigationRepository(
                         gpsSpeed = if (loc?.hasSpeed() == true) loc.speed.toDouble() else 0.0,
                         gpsSats = loc?.extras?.getInt("satellites", 0) ?: 0,
                         gpsAccuracy = if (loc?.hasAccuracy() == true) loc.accuracy.toDouble() else 0.0,
+                        smmSegCount = mapMatcher.segmentCount,
+                        smmCandidates = mapMatcher.lastCandidateCount,
+                        smmNearestM = if (mapMatcher.lastNearestDistM == Double.MAX_VALUE) -1.0 else mapMatcher.lastNearestDistM,
+                        smmCorrectionM = mapMatcher.lastCorrectionM,
                     )
 
                     _diagnosticState.value = com.dracarys.idr.ui.state.DiagnosticState(
@@ -531,6 +606,11 @@ class LiveNavigationRepository(
                         gpsProvider = loc?.provider ?: "none",
                         isGpsProviderEnabled = sensorCollector.isGpsProviderEnabled,
                         isNetworkProviderEnabled = sensorCollector.isNetworkProviderEnabled,
+                        smmSegmentCount = mapMatcher.segmentCount,
+                        smmCandidateCount = mapMatcher.lastCandidateCount,
+                        smmNearestDistM = if (mapMatcher.lastNearestDistM == Double.MAX_VALUE) -1.0 else mapMatcher.lastNearestDistM,
+                        smmCorrectionM = mapMatcher.lastCorrectionM,
+                        smmFetchStatus = roadFetcher.lastFetchStatus,
                     )
 
                     _state.value = NavigationState(
