@@ -3,6 +3,12 @@
 **Smart India Hackathon 2026 (SIH26168)**
 **Organization**: ISRO — Department of Space | **Track**: Software | **Theme**: Miscellaneous
 **Team**: Dracarys
+**Team Members: 1. Salil Sampat
+                2. Parth Kanade
+                3. Viraj Chodhary
+                4. Anushka Patil
+                5. Yogeswari Bhoi
+                6. Neha Chhipa
 
 ---
 
